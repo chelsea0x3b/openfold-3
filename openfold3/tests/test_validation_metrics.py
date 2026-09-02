@@ -29,6 +29,7 @@ from openfold3.core.metrics.quality import (
     gdt_ts,
     get_ab_ag_metrics,
     get_metrics,
+    get_metrics_batch_chunked,
     get_metrics_chunked,
     get_superimpose_metrics,
     interface_lddt,
@@ -411,6 +412,77 @@ class TestAllMetrics(unittest.TestCase):
             assert value.shape == (consts.batch_size, no_samples)
             assert chunked_value.shape == (consts.batch_size, no_samples)
             assert torch.allclose(value, chunked_value)
+
+    def test_all_metrics_batch_chunked_uneven_moltype_counts(self):
+        """Batch elements whose molecule-type atom counts differ.
+
+        get_metrics selects the atoms of a molecule type with a boolean mask over
+        the whole tensor and reshapes the flat result back to
+        [B, N_sample, ...], which is only valid when every batch element holds the
+        same number of atoms of that type. random_of3_features repeats one
+        structure across the batch, so the plain equivalence test above never
+        exercises an uneven batch -- real crops are uneven, and there the 2D
+        reshape in select_inter_filter_mask raises while the 1D reshapes silently
+        split the concatenated atoms at the wrong offset.
+
+        get_metrics_batch_chunked slices the batch dimension first, so each
+        element must match computing it on its own.
+        """
+        no_samples = 5
+        batch_size = 2
+
+        batch = random_of3_features(
+            batch_size=batch_size,
+            n_token=consts.n_res,
+            n_msa=consts.n_seq,
+            n_templ=consts.n_templ,
+            is_eval=True,
+        )
+
+        # Mask out the tail of element 1's tokens, the way a shorter crop arrives
+        # from the collator. This makes the two elements differ both in protein
+        # atom count (which the reshapes in get_protein_metrics assume equal) and
+        # in total real atom count, while atom_mask and the GT coordinates stay
+        # padded to the longer element -- the two independent ways batching breaks
+        # these metrics.
+        batch["token_mask"][1, consts.n_res // 2 :] = 0
+
+        def expand_sample_dim(t: torch.tensor) -> torch.tensor:
+            feat_dims = t.shape[2:]
+            return t.expand(-1, no_samples, *((-1,) * len(feat_dims)))
+
+        batch = tensor_tree_map(lambda t: t.unsqueeze(1), batch)
+        batch["ground_truth"] = tensor_tree_map(
+            expand_sample_dim, batch["ground_truth"]
+        )
+
+        n_atom = batch["ref_pos"].shape[-2]
+        outputs = {
+            "atom_positions_predicted": torch.randn(batch_size, no_samples, n_atom, 3)
+        }
+
+        metrics = get_metrics_batch_chunked(
+            batch, outputs, compute_extra_val_metrics=False
+        )
+        assert metrics, "no metrics returned"
+
+        # Each element must equal the metric computed from that element alone.
+        for idx in range(batch_size):
+            single = tensor_tree_map(
+                lambda t: t[idx : idx + 1] if t.shape[0] == batch_size else t,  # noqa: B023
+                {"batch": batch, "outputs": outputs},
+                strict_type=False,
+            )
+            expected = get_metrics(
+                single["batch"], single["outputs"], compute_extra_val_metrics=False
+            )
+            for name, value in metrics.items():
+                assert value.shape == (batch_size, no_samples), (name, value.shape)
+                if name in expected:
+                    assert torch.allclose(value[idx], expected[name][0]), name
+                else:
+                    # Zero-filled for elements that did not produce the metric.
+                    assert torch.all(value[idx] == 0), name
 
 
 # =============================================================================

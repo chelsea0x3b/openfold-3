@@ -154,6 +154,14 @@ class MultiDatasetConfig:
 class DataModuleConfig(BaseModel):
     datasets: list[SerializeAsAny[BaseModel]]
     batch_size: int = 1
+    # Validation is collated separately from training and defaults to 1.
+    # Validation datasets typically run with token cropping disabled, so their
+    # token count is the structure's real one. openfold_batch_collator pads via
+    # pad_sequence, which only pads dim 0 and requires matching trailing dims,
+    # so pair features ([N_token, N_token] token_bonds, template_distogram) from
+    # differently-sized structures cannot be stacked. Raise this only for
+    # validation sets that crop to a fixed token_budget.
+    batch_size_validation: int = 1
     num_workers: int = 0
     prefetch_factor: int | None = None
     num_workers_validation: int = 0
@@ -244,6 +252,7 @@ class DataModule(pl.LightningDataModule):
 
         # Possibly initialize directly from DataModuleConfig
         self.batch_size = data_module_config.batch_size
+        self.batch_size_validation = data_module_config.batch_size_validation
 
         self.num_workers = data_module_config.num_workers
         self.prefetch_factor = data_module_config.prefetch_factor
@@ -497,9 +506,11 @@ class DataModule(pl.LightningDataModule):
             mode == DatasetMode.validation
             and DatasetMode.train in self.multi_dataset_config.modes
         ):
+            batch_size = self.batch_size_validation
             num_workers = self.num_workers_validation
             prefetch_factor = self.prefetch_factor_validation
         else:
+            batch_size = self.batch_size
             num_workers = self.num_workers
             prefetch_factor = self.prefetch_factor
 
@@ -528,13 +539,14 @@ class DataModule(pl.LightningDataModule):
 
         logger.debug(
             f"Creating {mode} dataloader: "
+            f"batch_size={batch_size}, "
             f"num_workers={num_workers}, "
             f"multiprocessing_context={multiprocessing_context}, "
             f"rank={self.global_rank}."
         )
         return DataLoader(
             dataset=self.datasets_by_mode[mode],
-            batch_size=self.batch_size,
+            batch_size=batch_size,
             sampler=sampler,
             num_workers=num_workers,
             collate_fn=openfold_batch_collator,

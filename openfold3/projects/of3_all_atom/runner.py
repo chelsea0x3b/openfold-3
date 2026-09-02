@@ -35,6 +35,7 @@ from openfold3.core.metrics.model_selection import (
 )
 from openfold3.core.metrics.quality import (
     get_metrics,
+    get_metrics_batch_chunked,
     get_metrics_chunked,
 )
 from openfold3.core.runners.model_runner import ModelRunner
@@ -242,7 +243,22 @@ class OpenFold3AllAtom(ModelRunner):
 
     def _get_metrics(self, batch, outputs, train=True) -> dict:
         with torch.no_grad():
+            # The metrics select atoms per molecule type with a boolean mask and
+            # reshape back to [B, N_sample, ...], which is only valid when every
+            # batch element has the same number of atoms of that type. Above
+            # batch size 1 they have to be computed one element at a time.
+            batch_size = outputs["atom_positions_predicted"].shape[0]
+
             if train:
+                if batch_size > 1:
+                    return get_metrics_batch_chunked(
+                        batch,
+                        outputs,
+                        metrics_fn=get_metrics,
+                        compute_lig_diffusion_metrics=True,
+                        compute_extra_val_metrics=False,
+                    )
+
                 return get_metrics(
                     batch,
                     outputs,
@@ -260,14 +276,19 @@ class OpenFold3AllAtom(ModelRunner):
                 and num_atoms > self.config.settings.memory.eval.per_sample_atom_cutoff
             )
 
-            if chunk_metrics_computation:
-                metrics_per_sample = get_metrics_chunked(
+            metrics_fn = (
+                get_metrics_chunked if chunk_metrics_computation else get_metrics
+            )
+
+            if batch_size > 1:
+                metrics_per_sample = get_metrics_batch_chunked(
                     batch,
                     outputs,
+                    metrics_fn=metrics_fn,
                     compute_extra_val_metrics=True,
                 )
             else:
-                metrics_per_sample = get_metrics(
+                metrics_per_sample = metrics_fn(
                     batch,
                     outputs,
                     compute_extra_val_metrics=True,
@@ -341,7 +362,11 @@ class OpenFold3AllAtom(ModelRunner):
             if train and log_train_step_metrics:
                 self.log(
                     f"{metric_log_name}_step",
-                    metric_value,
+                    # Metrics come back as [B, N_sample], so above batch size 1
+                    # this is no longer a single element. Reduce the same way the
+                    # epoch MeanMetric above does, so the step and epoch values
+                    # stay consistent.
+                    metric_value.mean(),
                     on_step=True,
                     on_epoch=False,
                     logger=True,
@@ -371,7 +396,7 @@ class OpenFold3AllAtom(ModelRunner):
         )
 
         total_conf_weight = sum(
-            loss_weights[name].item() for name in confidence_loss_name
+            loss_weights[name].mean().item() for name in confidence_loss_name
         )
 
         is_valid_confidence_sample = total_conf_weight > 0
@@ -386,9 +411,9 @@ class OpenFold3AllAtom(ModelRunner):
         return None
 
     def _training_step_manual_clip(self, batch, batch_idx):
-        assert len(batch["pdb_id"]) == 1, (
-            "Currently only local batch size of 1 per GPU is supported."
-        )
+        # assert len(batch["pdb_id"]) == 1, (
+        #     "Currently only local batch size of 1 per GPU is supported."
+        # )
 
         if self.trainer.world_size > 1:
             assert isinstance(self.trainer.strategy, DDPStrategy), (

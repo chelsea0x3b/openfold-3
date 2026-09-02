@@ -64,7 +64,7 @@ def get_optimal_rotation_matrix(
     original_dtype = H.dtype
 
     # This is necessary for bf16/fp16 training
-    with torch.amp.autocast(autocast_device_type(H), dtype=torch.float32):
+    with torch.amp.autocast(autocast_device_type(H), dtype=torch.float32, enabled=False):
         try:
             U, _, Vt = torch.linalg.svd(H.float())
 

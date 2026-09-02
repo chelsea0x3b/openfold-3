@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from itertools import combinations, combinations_with_replacement
 from typing import Literal
@@ -2042,6 +2042,14 @@ def get_metrics(
     token_mask = batch["token_mask"]
     atom_padding_mask = batch["atom_mask"]
     num_atoms_per_token = batch["num_atoms_per_token"]
+    # Every atom-dim tensor here (atom_mask, the permutation-aligned GT
+    # coordinates, the predicted coordinates) is padded to the largest real atom
+    # count in the collated batch. broadcast_token_feat_to_atoms would otherwise
+    # size its output from max(sum(num_atoms_per_token)) over whatever batch it is
+    # handed, which only equals that padding when the whole batch is present --
+    # computing metrics one element at a time would silently shorten the atom
+    # dimension to that element's own count. Pin it instead.
+    n_atom_padded = atom_padding_mask.shape[-1]
     no_samples = pred_coords.shape[1]
     # getting rid of modified residues
     is_protein = batch["is_protein"]
@@ -2070,6 +2078,7 @@ def get_metrics(
             token_mask=token_mask,
             num_atoms_per_token=num_atoms_per_token,
             token_feat=is_protein,
+            max_num_atoms=n_atom_padded,
         )
     ).bool()
 
@@ -2078,6 +2087,7 @@ def get_metrics(
             token_mask=token_mask,
             num_atoms_per_token=num_atoms_per_token,
             token_feat=batch["is_ligand"],
+            max_num_atoms=n_atom_padded,
         )
     ).bool()
 
@@ -2086,6 +2096,7 @@ def get_metrics(
             token_mask=token_mask,
             num_atoms_per_token=num_atoms_per_token,
             token_feat=is_rna,
+            max_num_atoms=n_atom_padded,
         )
     ).bool()
 
@@ -2094,6 +2105,7 @@ def get_metrics(
             token_mask=token_mask,
             num_atoms_per_token=num_atoms_per_token,
             token_feat=is_dna,
+            max_num_atoms=n_atom_padded,
         )
     ).bool()
 
@@ -2104,6 +2116,7 @@ def get_metrics(
             token_mask=token_mask,
             num_atoms_per_token=num_atoms_per_token,
             token_feat=is_modified_residue,
+            max_num_atoms=n_atom_padded,
         )
     ).bool()
 
@@ -2112,6 +2125,7 @@ def get_metrics(
             token_mask=token_mask,
             num_atoms_per_token=num_atoms_per_token,
             token_feat=batch["asym_id"],
+            max_num_atoms=n_atom_padded,
         )
     )
 
@@ -2299,6 +2313,7 @@ def get_metrics(
                     token_mask=token_mask,
                     num_atoms_per_token=num_atoms_per_token,
                     token_feat=batch["residue_index"],
+                    max_num_atoms=n_atom_padded,
                 )
             )
             ref_atom_name_chars_atomized = expand_sample_dim(
@@ -2389,3 +2404,71 @@ def get_metrics_chunked(
         metrics_per_sample[metric_name] = torch.concat(metric_values, dim=1)
 
     return metrics_per_sample
+
+
+def get_metrics_batch_chunked(
+    batch,
+    outputs,
+    metrics_fn: Callable = get_metrics,
+    **kwargs,
+) -> dict[str, torch.Tensor]:
+    """
+    Compute metrics one batch element at a time and concatenate the results.
+
+    The metric functions in this module select the atoms of a molecule type with a
+    boolean mask over the whole tensor and then reshape the flat result back to
+    [B, N_sample, ...] -- for example
+    ``gt_coords[is_protein_atomized].view(bs + (-1, 3))`` in get_protein_metrics.
+    masked_select concatenates across the batch, so that reshape is only valid
+    when every batch element contains the *same* number of atoms of that type.
+    That holds trivially at batch size 1 and essentially never above it: with two
+    crops of 3152 and 2832 protein atoms the pairwise reshape in
+    select_inter_filter_mask raises, and the 1D reshapes silently split the
+    concatenated atoms at the wrong offset. Slicing the batch dimension before
+    calling the metrics restores the invariant they were written against.
+
+    Args:
+        batch: ground truth and permutation applied features
+        outputs: model outputs
+        metrics_fn: metrics function to apply per batch element, either
+            get_metrics or get_metrics_chunked (which chunks the sample dim)
+        kwargs: forwarded unchanged to metrics_fn
+    Returns:
+        metrics: dict of metrics concatenated along the batch dimension
+
+    Note:
+        Which metrics get computed depends on the molecule types present, so a
+        metric may be produced for some batch elements and not others. Those are
+        zero-filled, following the same masking convention get_metrics uses for
+        samples that do not pass a threshold.
+    """
+    batch_size = outputs["atom_positions_predicted"].shape[0]
+
+    metrics_per_batch_list = []
+    for idx in range(batch_size):
+
+        def fetch_cur_batch(t):
+            if t.dim() == 0 or t.shape[0] != batch_size:
+                return t
+            return t[idx : idx + 1]  # noqa: B023
+
+        cur_batch = tensor_tree_map(fetch_cur_batch, batch, strict_type=False)
+        cur_outputs = tensor_tree_map(fetch_cur_batch, outputs, strict_type=False)
+        metrics_per_batch_list.append(metrics_fn(cur_batch, cur_outputs, **kwargs))
+
+    metrics = {}
+    all_metric_keys = set().union(*(m.keys() for m in metrics_per_batch_list))
+
+    for metric_name in all_metric_keys:
+        # Shape the zero fill from an element that did produce the metric rather
+        # than assuming it, since metric shapes vary across the returned dict.
+        reference = next(
+            m[metric_name] for m in metrics_per_batch_list if metric_name in m
+        )
+        metric_values = [
+            m[metric_name] if metric_name in m else torch.zeros_like(reference)
+            for m in metrics_per_batch_list
+        ]
+        metrics[metric_name] = torch.concat(metric_values, dim=0)
+
+    return metrics
