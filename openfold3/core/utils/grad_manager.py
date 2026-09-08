@@ -79,6 +79,12 @@ class PerSampleGradManager:
         self.accumulate_grad_batches = accumulate_grad_batches
         self.log_grad_norm = log_grad_norm
 
+        # With a single micro-batch per step there is nothing to accumulate
+        # across, so param.grad already holds the (clipped) result and the
+        # separate buffer is a redundant full-model copy. Skipping it saves one
+        # fp32 copy of every trainable parameter for the whole run.
+        self.use_grad_accumulator = accumulate_grad_batches > 1
+
         self.grad_accumulator = {}
         self._params_to_update = {}
 
@@ -119,10 +125,14 @@ class PerSampleGradManager:
 
         self._device = next(iter(self._params_to_update.values())).device
 
-        self.grad_accumulator = {
-            name: torch.zeros_like(p, requires_grad=False)
-            for name, p in self._params_to_update.items()
-        }
+        self.grad_accumulator = (
+            {
+                name: torch.zeros_like(p, requires_grad=False)
+                for name, p in self._params_to_update.items()
+            }
+            if self.use_grad_accumulator
+            else {}
+        )
 
         if self.max_grad_norm is not None:
             self._max_norm_tensor = torch.tensor(
@@ -267,15 +277,27 @@ class PerSampleGradManager:
         # Manually accumulate clipped grads and track param participation
         for name, param in self._params_to_update.items():
             if name in disabled_params:
+                # The accumulator path leaves these at zero for this sample, so
+                # the in-place path has to zero them explicitly rather than let
+                # the backward's value through.
+                if not self.use_grad_accumulator and param.grad is not None:
+                    param.grad.zero_()
                 continue
 
-            if param.grad is not None:
+            if param.grad is None:
+                # The accumulator path substitutes a zero buffer here; keep the
+                # in-place path's grads dense so _flatten_dense_tensors works.
+                if not self.use_grad_accumulator:
+                    param.grad = torch.zeros_like(param)
+                continue
+
+            if self.use_grad_accumulator:
                 self.grad_accumulator[name].add_(param.grad)
 
-                if name not in self.parameter_participation_counts:
-                    self.parameter_participation_counts[name] = 0
+            if name not in self.parameter_participation_counts:
+                self.parameter_participation_counts[name] = 0
 
-                self.parameter_participation_counts[name] += 1
+            self.parameter_participation_counts[name] += 1
 
         # Increment the global counter (still used for logging)
         # TODO: Get rid of this later
@@ -292,9 +314,11 @@ class PerSampleGradManager:
 
         This should be called before opt.step().
         """
-        # Copy summed grads from accumulator
-        for name, param in self._params_to_update.items():
-            param.grad = self.grad_accumulator[name].clone()
+        # Copy summed grads from accumulator. Without it, param.grad already
+        # holds the clipped single-sample gradient.
+        if self.use_grad_accumulator:
+            for name, param in self._params_to_update.items():
+                param.grad = self.grad_accumulator[name].clone()
 
         # Sync and average globally
         self._sync_and_average_grads()
