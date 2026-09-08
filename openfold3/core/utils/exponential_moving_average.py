@@ -63,8 +63,21 @@ class ExponentialMovingAverage:
         self.device = next(model.parameters()).device
 
     def init_params(self, model: torch.nn.Module):
+        # SampleDiffusion registers the diffusion module as an alias, so
+        # model.state_dict() exposes 763 of its tensors under two prefixes
+        # each. Cloning per key would hold two EMA copies of the same weight.
+        # Clone once per distinct source tensor and share it across aliases;
+        # _update_state_dict_ skips repeats so the decay rate is unchanged.
+        shared: dict[int, torch.Tensor] = {}
+
         def clone_param(t):
-            return t.detach().clone()
+            if not isinstance(t, torch.Tensor):
+                return t.detach().clone()
+
+            ptr = t.data_ptr()
+            if ptr not in shared:
+                shared[ptr] = t.detach().clone()
+            return shared[ptr]
 
         self.params = tensor_tree_map(clone_param, model.state_dict())
         self.device = next(model.parameters()).device
@@ -74,13 +87,23 @@ class ExponentialMovingAverage:
         self.device = device
         return self
 
-    def _update_state_dict_(self, update, state_dict):
+    def _update_state_dict_(self, update, state_dict, _updated=None):
+        # Aliased state_dict keys share one stored tensor (see init_params), so
+        # track what has already been decayed this call. Without this each
+        # aliased weight would be decayed once per alias instead of once.
+        if _updated is None:
+            _updated = set()
+
         with torch.no_grad():
             for k, v in update.items():
                 stored = state_dict[k]
                 if not isinstance(v, torch.Tensor):
-                    self._update_state_dict_(v, stored)
+                    self._update_state_dict_(v, stored, _updated)
                 else:
+                    if id(stored) in _updated:
+                        continue
+                    _updated.add(id(stored))
+
                     diff = stored - v
                     diff *= 1 - self.decay
                     stored -= diff
@@ -120,8 +143,14 @@ class ExponentialMovingAverage:
         self._update_state_dict_(update_dict, self.params)
 
     def load_state_dict(self, state_dict: OrderedDict) -> None:
-        for k in state_dict["params"]:
-            self.params[k] = state_dict["params"][k].clone()
+        # Preserve the alias sharing established in init_params, so resuming
+        # from a checkpoint does not silently reinflate the EMA copy.
+        shared: dict[int, torch.Tensor] = {}
+        for k, v in state_dict["params"].items():
+            ptr = v.data_ptr()
+            if ptr not in shared:
+                shared[ptr] = v.clone()
+            self.params[k] = shared[ptr]
         self.decay = state_dict["decay"]
 
     def state_dict(self) -> OrderedDict:
