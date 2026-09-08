@@ -166,6 +166,20 @@ class OpenFold3(nn.Module):
 
         return offload_inference
 
+    def _offload_ctx(self, region: str):
+        """CPU-offload saved activations for `region`, if configured.
+
+        Under activation checkpointing the only tensors a stack saves for
+        backward are its per-block boundary tensors, so this is a handful of
+        large host transfers rather than many small ones. Pure data movement,
+        so bit-exact.
+        """
+        enabled = region in self._get_mode_mem_settings().offload_activations
+        if not enabled:
+            return nullcontext()
+
+        return torch.autograd.graph.save_on_cpu(pin_memory=True)
+
     @staticmethod
     def clear_autocast_cache():
         if torch.is_autocast_enabled():
@@ -289,20 +303,21 @@ class OpenFold3(nn.Module):
 
                     del input_tensors, msa_mask
                 else:
-                    z = self.msa_module(
-                        m,
-                        z,
-                        msa_mask=msa_mask.to(dtype=m.dtype),
-                        pair_mask=pair_mask.to(dtype=z.dtype),
-                        chunk_size=mode_mem_settings.chunk_size,
-                        transition_ckpt_chunk_size=transition_ckpt_chunk_size,
-                        use_deepspeed_evo_attention=mode_mem_settings.use_deepspeed_evo_attention,
-                        use_triton_triangle_kernels=mode_mem_settings.use_triton_triangle_kernels,
-                        use_cueq_triangle_kernels=mode_mem_settings.use_cueq_triangle_kernels,
-                        use_lma=mode_mem_settings.use_lma,
-                        inplace_safe=inplace_safe,
-                        _mask_trans=True,
-                    )
+                    with self._offload_ctx("msa_module"):
+                        z = self.msa_module(
+                            m,
+                            z,
+                            msa_mask=msa_mask.to(dtype=m.dtype),
+                            pair_mask=pair_mask.to(dtype=z.dtype),
+                            chunk_size=mode_mem_settings.chunk_size,
+                            transition_ckpt_chunk_size=transition_ckpt_chunk_size,
+                            use_deepspeed_evo_attention=mode_mem_settings.use_deepspeed_evo_attention,
+                            use_triton_triangle_kernels=mode_mem_settings.use_triton_triangle_kernels,
+                            use_cueq_triangle_kernels=mode_mem_settings.use_cueq_triangle_kernels,
+                            use_lma=mode_mem_settings.use_lma,
+                            inplace_safe=inplace_safe,
+                            _mask_trans=True,
+                        )
 
                     del m, msa_mask
 
@@ -311,12 +326,7 @@ class OpenFold3(nn.Module):
                 # across the stack are one block-boundary tensor per block, so
                 # offloading them is a small number of large transfers rather
                 # than many small ones. Pure data movement, so bit-exact.
-                offload_ctx = (
-                    torch.autograd.graph.save_on_cpu(pin_memory=True)
-                    if mode_mem_settings.offload_pairformer_activations
-                    else nullcontext()
-                )
-                with offload_ctx:
+                with self._offload_ctx("pairformer"):
                     s, z = self.pairformer_stack(
                         s=s,
                         z=z,
@@ -504,19 +514,20 @@ class OpenFold3(nn.Module):
         use_conditioning = random.random() < self.shared.diffusion.use_conditioning_prob
 
         # Run diffusion module
-        xl = self.diffusion_module(
-            batch=batch,
-            xl_noisy=xl_noisy,
-            token_mask=batch["token_mask"],
-            atom_mask=atom_mask_gt,
-            t=t,
-            si_input=si_input,
-            si_trunk=si_trunk,
-            zij_trunk=zij_trunk,
-            use_conditioning=use_conditioning,
-            use_high_precision_attention=True,
-            _mask_trans=True,
-        )
+        with self._offload_ctx("diffusion_module"):
+            xl = self.diffusion_module(
+                batch=batch,
+                xl_noisy=xl_noisy,
+                token_mask=batch["token_mask"],
+                atom_mask=atom_mask_gt,
+                t=t,
+                si_input=si_input,
+                si_trunk=si_trunk,
+                zij_trunk=zij_trunk,
+                use_conditioning=use_conditioning,
+                use_high_precision_attention=True,
+                _mask_trans=True,
+            )
 
         output = {
             "noise_level": t,
