@@ -19,6 +19,7 @@ The main inference and training loops for AlphaFold3.
 """
 
 import random
+from contextlib import nullcontext
 from enum import Enum
 
 import numpy as np
@@ -306,19 +307,29 @@ class OpenFold3(nn.Module):
                     del m, msa_mask
 
                 s = s_init + self.linear_s(self.layer_norm_s(s))
-                s, z = self.pairformer_stack(
-                    s=s,
-                    z=z,
-                    single_mask=token_mask.to(dtype=z.dtype),
-                    pair_mask=pair_mask.to(dtype=s.dtype),
-                    chunk_size=mode_mem_settings.chunk_size,
-                    use_deepspeed_evo_attention=mode_mem_settings.use_deepspeed_evo_attention,
-                    use_triton_triangle_kernels=mode_mem_settings.use_triton_triangle_kernels,
-                    use_cueq_triangle_kernels=mode_mem_settings.use_cueq_triangle_kernels,
-                    use_lma=mode_mem_settings.use_lma,
-                    inplace_safe=inplace_safe,
-                    _mask_trans=True,
+                # With blocks_per_ckpt set, the only tensors saved for backward
+                # across the stack are one block-boundary tensor per block, so
+                # offloading them is a small number of large transfers rather
+                # than many small ones. Pure data movement, so bit-exact.
+                offload_ctx = (
+                    torch.autograd.graph.save_on_cpu(pin_memory=True)
+                    if mode_mem_settings.offload_pairformer_activations
+                    else nullcontext()
                 )
+                with offload_ctx:
+                    s, z = self.pairformer_stack(
+                        s=s,
+                        z=z,
+                        single_mask=token_mask.to(dtype=z.dtype),
+                        pair_mask=pair_mask.to(dtype=s.dtype),
+                        chunk_size=mode_mem_settings.chunk_size,
+                        use_deepspeed_evo_attention=mode_mem_settings.use_deepspeed_evo_attention,
+                        use_triton_triangle_kernels=mode_mem_settings.use_triton_triangle_kernels,
+                        use_cueq_triangle_kernels=mode_mem_settings.use_cueq_triangle_kernels,
+                        use_lma=mode_mem_settings.use_lma,
+                        inplace_safe=inplace_safe,
+                        _mask_trans=True,
+                    )
 
         del s_init, z_init
 
