@@ -160,7 +160,13 @@ model_config = mlc.ConfigDict(
                 "decay_every_n_steps": 50000,
                 "decay_factor": 0.95,
             },
-            "ema": {"decay": 0.999, "submodules_to_update": None},
+            "ema": {
+                "decay": 0.999,
+                "submodules_to_update": None,
+                # Keep the EMA shadow in host memory (see
+                # ExponentialMovingAverage.offload_to_cpu)
+                "offload_to_cpu": False,
+            },
             "gradient_clipping": {
                 "per_sample_clipping": True,
                 "clip_val": 10.0,
