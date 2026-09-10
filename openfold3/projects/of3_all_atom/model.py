@@ -116,6 +116,25 @@ class OpenFold3(nn.Module):
 
         self.register_buffer("version_tensor", MODEL_VERSION)
 
+        # Checkpoints written before SampleDiffusion stopped registering the
+        # diffusion module carry duplicate sample_diffusion.diffusion_module.*
+        # entries. Drop them on load so strict=True still succeeds.
+        self._register_load_state_dict_pre_hook(self._drop_legacy_alias_keys)
+
+    @staticmethod
+    def _drop_legacy_alias_keys(state_dict, prefix, *_args):
+        """Strip the duplicate diffusion-module keys older checkpoints carry.
+
+        Mutating state_dict in place is what load-state-dict pre-hooks are for
+        (it is how torch's own version-compat hooks work); copying a full
+        checkpoint's worth of tensors to avoid it would be far more expensive.
+        The released of3-p2-155k.pt checkpoint carries 763 such keys, so
+        without this every strict load of an existing checkpoint would fail.
+        """
+        legacy = f"{prefix}sample_diffusion.diffusion_module."
+        for key in [k for k in state_dict if k.startswith(legacy)]:
+            del state_dict[key]
+
     def _disable_activation_checkpointing(self):
         """
         Disable activation checkpointing for the TemplateEmbedder, MSAModule,

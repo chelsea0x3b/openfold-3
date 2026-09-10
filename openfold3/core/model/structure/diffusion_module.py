@@ -284,7 +284,16 @@ class SampleDiffusion(nn.Module):
         self.gamma_min = gamma_min
         self.noise_scale = noise_scale
         self.step_scale = step_scale
-        self.diffusion_module = diffusion_module
+
+        # Deliberately not registered as a submodule: this is the *same object*
+        # as OpenFold3.diffusion_module. Registering it here put the shared
+        # parameters at two places in the module tree, which duplicated 763
+        # state_dict keys (and so 763 EMA shadow copies) and prevents FSDP from
+        # wrapping them into a single unit -- shared parameters must live in one.
+        # object.__setattr__ bypasses nn.Module's submodule registration while
+        # leaving attribute access unchanged; device/dtype/train() propagation
+        # still reaches it through OpenFold3, which owns it.
+        object.__setattr__(self, "diffusion_module", diffusion_module)
 
     def _sample_rollout(
         self,
