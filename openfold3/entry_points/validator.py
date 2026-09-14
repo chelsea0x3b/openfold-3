@@ -135,6 +135,29 @@ class PlTrainerArgs(BaseModel):
     gradient_clip_val: int | float | None = None
     gradient_clip_algorithm: str | None = None
 
+    # Which distributed strategy to build when world_size > 1. "fsdp" shards
+    # parameters, gradients and optimizer state across ranks; see
+    # ExperimentRunner.strategy.
+    distributed_strategy: Literal["ddp", "fsdp", "fsdp2"] = "ddp"
+
+    # FSDP wrap granularity. Gradient and optimizer-state sharding is
+    # granularity-independent; this only trades how much all-gathered parameter
+    # memory is resident at peak against the number of collectives per step.
+    # "stack" is ~7 units (~14 collectives, largest unit 757 MiB); "block" is
+    # ~91 units (~182 collectives, largest unit 32 MiB) which is far leaner but
+    # measured 4x slower on this launch-bound model.
+    fsdp_wrap_granularity: Literal["minimal", "stack", "block"] = "stack"
+
+    # FSDP2 (ModelParallelStrategy) only. Sharded checkpoints conflict with the
+    # EMA, the validation weight swap and ModelCheckpoint, all of which expect
+    # an ordinary state_dict.
+    fsdp2_distributed_checkpoint: bool = False
+
+    # Parameter-count threshold for the "minimal" granularity. 50M isolates the
+    # two stacks holding 94% of parameters (diffusion_transformer 198M,
+    # pairformer_stack 147M) into 2 units.
+    fsdp_min_wrap_params: int = 50_000_000
+
     # Extra arguments that are not passed directly to pl.Trainer
     deepspeed_config_path: Path | None = None
     distributed_timeout: timedelta | None = default_pg_timeout

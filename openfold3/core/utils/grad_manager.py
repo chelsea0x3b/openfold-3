@@ -21,9 +21,38 @@ import torch.distributed as dist
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from torchmetrics import MaxMetric, MeanMetric
 
+from openfold3.core.utils.debug_timing import phase_timer
+from openfold3.core.utils.fsdp2_grads import Fsdp2GradBridge, is_fsdp2_module
 from openfold3.core.utils.tensor_utils import tensor_tree_map
 
 logger = logging.getLogger(__name__)
+
+
+@torch.no_grad()
+def compute_grad_norm(
+    grads: Iterable[torch.Tensor], device: torch.device | None = None
+) -> torch.Tensor:
+    """
+    Calculates the global L2 norm over a collection of gradient tensors.
+
+    Takes the gradients themselves rather than their parameters because under
+    FSDP2 a retained gradient is not reachable as ``param.grad``.
+
+    Args:
+        grads (Iterable[Tensor]): The gradient tensors to norm over.
+        device (torch.device | None): Device for the zero returned when
+            ``grads`` is empty.
+    Returns:
+        global_norm (torch.Tensor): The scalar global norm.
+    """
+    grads = list(grads)
+
+    if not grads:
+        return torch.tensor(0.0, device=device)
+
+    per_tensor_norms = [torch.linalg.vector_norm(g.float(), ord=2) for g in grads]
+
+    return torch.linalg.vector_norm(torch.stack(per_tensor_norms), ord=2)
 
 
 @torch.no_grad()
@@ -39,18 +68,14 @@ def compute_global_norm(
         global_norm (torch.Tensor): The scalar global norm.
         params_with_grad (list): The list of parameters that have gradients.
     """
+    parameters = list(parameters)
     params_with_grad = [p for p in parameters if p.grad is not None]
 
     if not params_with_grad:
-        device = next(iter(parameters)).device
+        device = parameters[0].device if parameters else None
         return torch.tensor(0.0, device=device), []
 
-    # Calculate the total norm of all parameter gradients
-    per_tensor_norms = [
-        torch.linalg.vector_norm(p.grad.float(), ord=2) for p in params_with_grad
-    ]
-
-    global_norm = torch.linalg.vector_norm(torch.stack(per_tensor_norms), ord=2)
+    global_norm = compute_grad_norm(p.grad for p in params_with_grad)
 
     return global_norm, params_with_grad
 
@@ -108,6 +133,13 @@ class PerSampleGradManager:
         # Cache max_norm tensor
         self._max_norm_tensor = None
 
+        # Set on first use; see the grad_bridge property
+        self._grad_bridge = None
+        self._grad_bridge_resolved = False
+
+        # Debug instrumentation; drained by collect_phase_times
+        self.phase_events = {}
+
     def setup(
         self, model: torch.nn.Module, trainer: "pl.Trainer", logger: "pl.loggers.Logger"
     ):
@@ -147,6 +179,44 @@ class PerSampleGradManager:
                 self._device
             )
 
+    @property
+    def grad_bridge(self) -> Fsdp2GradBridge | None:
+        """The FSDP2 gradient bridge, or None when gradients live on params.
+
+        Resolved on first use rather than in setup() because fully_shard is
+        applied in configure_model(), which Lightning runs afterwards.
+        """
+        if not self._grad_bridge_resolved:
+            self._grad_bridge_resolved = True
+            if is_fsdp2_module(self._model):
+                self._grad_bridge = Fsdp2GradBridge(
+                    self._model, phase_events=self.phase_events
+                )
+                logger.info(
+                    "Per-sample gradient clipping is reading FSDP2's retained "
+                    "gradients; the reduce-scatter backward skipped runs at "
+                    "the end of the step."
+                )
+        return self._grad_bridge
+
+    def _named_grads(self) -> dict[str, torch.Tensor]:
+        """This rank's unreduced gradients, keyed by parameter name.
+
+        Per-sample clipping needs the whole gradient for this rank's own
+        sample. Under DDP that is param.grad; under FSDP2 the parameter is a
+        shard and the full gradient is held inside FSDP2, so the bridge hands
+        it over.
+        """
+        bridge = self.grad_bridge
+        if bridge is not None:
+            return bridge.named_grads()
+
+        return {
+            name: param.grad
+            for name, param in self._params_to_update.items()
+            if param.grad is not None
+        }
+
     @torch.no_grad()
     def _clip_grads(
         self, logging_info: dict | None = None, disabled_params: set | None = None
@@ -155,15 +225,17 @@ class PerSampleGradManager:
         if disabled_params is None:
             disabled_params = set()
 
-        params_enabled = [
-            param
-            for name, param in self._params_to_update.items()
+        grads_enabled = [
+            grad
+            for name, grad in self._named_grads().items()
             if name not in disabled_params
         ]
-        global_norm, params_with_grad = compute_global_norm(parameters=params_enabled)
 
-        if not params_with_grad:
+        if not grads_enabled:
             return
+
+        with phase_timer(self.phase_events, "norm"):
+            global_norm = compute_grad_norm(grads_enabled, device=self._device)
 
         # Log the metrics even if clipping is disabled
         if self.log_grad_norm:
@@ -186,8 +258,9 @@ class PerSampleGradManager:
         )
 
         # Rescale gradients
-        for p in params_with_grad:
-            p.grad.mul_(clip_coef.to(p.dtype))
+        with phase_timer(self.phase_events, "rescale"):
+            for grad in grads_enabled:
+                grad.mul_(clip_coef.to(grad.dtype))
 
     @torch.no_grad()
     def _sync_and_average_grads(self):
@@ -218,10 +291,12 @@ class PerSampleGradManager:
         # Collect grads and parameters
         param_names = sorted(self._params_to_update.keys())
         params = [self._params_to_update[n] for n in param_names]
-        grads = [p.grad for p in params]
 
-        if not grads:
+        named_grads = self._named_grads()
+        if not named_grads:
             return
+
+        grads = [named_grads.get(n) for n in param_names]
 
         # Per-parameter sample counts [N_params]
         local_counts = [
@@ -230,6 +305,21 @@ class PerSampleGradManager:
         global_active_counts = self._trainer.strategy.reduce(
             torch.tensor(local_counts, device=self.device), reduce_op=dist.ReduceOp.SUM
         )
+
+        # Under FSDP2 the reduction also has to shard the result, so hand it
+        # back to FSDP2 with the per-parameter divisor folded in rather than
+        # all-reducing full gradients here.
+        bridge = self.grad_bridge
+        if bridge is not None:
+            counts = global_active_counts.tolist()
+            bridge.reduce(
+                divisors={
+                    name: count
+                    for name, count in zip(param_names, counts)
+                    if count > 0
+                }
+            )
+            return
 
         # Reduce gradients (flatten -> reduce -> unflatten)
         flat_grad = _flatten_dense_tensors(grads).float()
@@ -275,24 +365,41 @@ class PerSampleGradManager:
             disabled_params = set()
 
         # Manually accumulate clipped grads and track param participation
+        grads = self._named_grads()
+        on_params = self.grad_bridge is None
+
+        if self.use_grad_accumulator and not on_params:
+            # opt.zero_grad() clears param.grad, but the gradient FSDP2
+            # retains for the clip is held internally and survives it, so the
+            # next micro-batch's backward would add into this one and the
+            # "per-sample" norm would cover every micro-batch so far.
+            raise NotImplementedError(
+                "Per-sample gradient clipping under FSDP2 does not support "
+                "accumulate_grad_batches > 1. Use DDP, or set "
+                "accumulate_grad_batches to 1."
+            )
+
         for name, param in self._params_to_update.items():
+            grad = grads.get(name)
+
             if name in disabled_params:
                 # The accumulator path leaves these at zero for this sample, so
                 # the in-place path has to zero them explicitly rather than let
                 # the backward's value through.
-                if not self.use_grad_accumulator and param.grad is not None:
-                    param.grad.zero_()
+                if not self.use_grad_accumulator and grad is not None:
+                    grad.zero_()
                 continue
 
-            if param.grad is None:
+            if grad is None:
                 # The accumulator path substitutes a zero buffer here; keep the
                 # in-place path's grads dense so _flatten_dense_tensors works.
-                if not self.use_grad_accumulator:
+                # Under FSDP2 a missing gradient simply sits out the reduction.
+                if not self.use_grad_accumulator and on_params:
                     param.grad = torch.zeros_like(param)
                 continue
 
             if self.use_grad_accumulator:
-                self.grad_accumulator[name].add_(param.grad)
+                self.grad_accumulator[name].add_(grad)
 
             if name not in self.parameter_participation_counts:
                 self.parameter_participation_counts[name] = 0

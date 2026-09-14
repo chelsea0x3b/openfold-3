@@ -14,17 +14,26 @@
 
 import gc
 import importlib
+import json
 import logging
+import os
+import time
 import traceback
 import warnings
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from functools import partial
 from pathlib import Path
 
 import pytorch_lightning as pl
 import torch
-from pytorch_lightning.strategies import DDPStrategy, DeepSpeedStrategy
+from pytorch_lightning.strategies import (
+    DDPStrategy,
+    DeepSpeedStrategy,
+    FSDPStrategy,
+    ModelParallelStrategy,
+)
+from torch.distributed.fsdp import FSDPModule
 from torchmetrics import MeanMetric, MetricCollection, PearsonCorrCoef
 
 from openfold3.core.loss.loss_module import OpenFold3Loss
@@ -38,6 +47,7 @@ from openfold3.core.metrics.quality import (
     get_metrics_chunked,
 )
 from openfold3.core.runners.model_runner import ModelRunner
+from openfold3.core.utils.debug_timing import collect_phase_times
 from openfold3.core.utils.grad_manager import PerSampleGradManager, compute_global_norm
 from openfold3.core.utils.lr_schedulers import AlphaFoldLRScheduler
 from openfold3.core.utils.tensor_utils import tensor_tree_map
@@ -299,6 +309,9 @@ class OpenFold3AllAtom(ModelRunner):
     ):
         phase = "train" if train else "val"
 
+        if train:
+            self._capture_losses(loss_breakdown)
+
         metrics = self._get_metrics(batch, outputs, train=train)
 
         loss_collection = self.train_losses if phase == "train" else self.val_losses
@@ -348,6 +361,79 @@ class OpenFold3AllAtom(ModelRunner):
                     sync_dist=False,
                 )
 
+    @contextmanager
+    def _deferred_grad_sync(self):
+        """Hold off the cross-rank gradient reduction for the per-sample clip.
+
+        Per-sample clipping needs each rank's own single-sample gradient before
+        anything is averaged, so the reduction has to be deferred until after
+        the norm is measured and the scale applied.
+
+        DDP exposes no_sync(), a plain boolean flag. FSDP1's no_sync() asserts
+        the module is IDLE and so cannot be entered from inside training_step,
+        which Lightning runs inside FSDP's own forward -- that incompatibility
+        is why the sharded path requires FSDP2, whose
+        set_requires_gradient_sync() is likewise just a flag.
+        """
+        if self.trainer.world_size == 1:
+            yield
+            return
+
+        if isinstance(self.trainer.strategy, ModelParallelStrategy):
+            # configure_model applies fully_shard() to self.model, so the
+            # FSDPModule methods live there rather than on the LightningModule
+            # that self.trainer.model returns. recurse=True (the default)
+            # reaches the nested units as well.
+            if not isinstance(self.model, FSDPModule):
+                raise RuntimeError(
+                    "Expected self.model to be sharded by configure_model(); "
+                    "per-sample clipping cannot defer the gradient reduction."
+                )
+
+            self.model.set_requires_gradient_sync(False)
+            try:
+                yield
+            finally:
+                self.model.set_requires_gradient_sync(True)
+            return
+
+        with self.trainer.model.no_sync():
+            yield
+
+    def configure_model(self):
+        """Shard the model for FSDP2, when running under ModelParallelStrategy.
+
+        Only the two modules holding 94% of the parameters are sharded
+        individually, then the root. Measured on FSDP1: per-unit overhead runs
+        ~2-3%/unit on this launch-bound model while the memory win is
+        granularity-independent, so few large units is strictly better -- 2
+        units cost +5.4% against DDP where 91 cost +304%, for the same peak.
+        """
+        if not isinstance(self.trainer.strategy, ModelParallelStrategy):
+            return
+
+        from torch.distributed.fsdp import fully_shard
+
+        mesh = self.device_mesh["data_parallel"]
+        for module in (
+            self.model.pairformer_stack,
+            self.model.diffusion_module.diffusion_transformer,
+        ):
+            fully_shard(module, mesh=mesh)
+
+        fully_shard(self.model, mesh=mesh)
+
+    @property
+    def _forward_needs_rank_sync(self) -> bool:
+        """Whether every rank must run the forward pass in lockstep.
+
+        True for parameter-sharded strategies, where each wrapped module's
+        forward issues an all-gather; a rank that skips the forward leaves the
+        others blocked. DDP issues no collectives during a no_grad forward, so
+        padded ranks can simply return.
+        """
+        return isinstance(self.trainer.strategy, FSDPStrategy | ModelParallelStrategy)
+
     def _is_opt_step_ready(self, batch_idx: int) -> bool:
         """
         Checks if the optimizer step should be performed.
@@ -391,14 +477,15 @@ class OpenFold3AllAtom(ModelRunner):
         )
 
         if self.trainer.world_size > 1:
-            assert isinstance(self.trainer.strategy, DDPStrategy), (
-                "Per-sample gradient clipping is only supported with DDPStrategy."
+            assert isinstance(
+                self.trainer.strategy,
+                DDPStrategy | FSDPStrategy | ModelParallelStrategy,
+            ), (
+                "Per-sample gradient clipping supports DDPStrategy, FSDPStrategy "
+                "and ModelParallelStrategy."
             )
 
         example_feat = batch["token_mask"]
-
-        if len(self.ema.params) <= 1:
-            self.ema.init_params(self.model)
 
         if self.ema.device != example_feat.device:
             self.ema.to(example_feat.device)
@@ -431,26 +518,34 @@ class OpenFold3AllAtom(ModelRunner):
 
         try:
             # Only required when running in distributed mode
-            sync_context = (
-                self.trainer.model.no_sync()
-                if self.trainer.world_size > 1
-                else nullcontext()
-            )
-
-            # When using DDP, this disables the automatic sync that would happen on
-            # manual_backward and break the per-sample grad clipping
-            with sync_context:
+            # Defer cross-rank reduction so each rank keeps its own sample's
+            # gradient long enough to measure and clip it
+            with self._deferred_grad_sync():
                 # Run the model
+                # --- memprobe: localize the step peak to a phase ---
+                _mp = torch.cuda.is_available()
+                if _mp:
+                    torch.cuda.reset_peak_memory_stats()
                 batch, outputs = self.model(batch)
+                if _mp:
+                    self._mem_fwd = torch.cuda.max_memory_allocated()
+                    torch.cuda.reset_peak_memory_stats()
 
                 # Compute loss
                 loss, loss_breakdown = self.loss(batch, outputs, _return_breakdown=True)
+                if _mp:
+                    self._mem_loss = torch.cuda.max_memory_allocated()
+                    torch.cuda.reset_peak_memory_stats()
 
                 self.manual_backward(loss)
+                if _mp:
+                    self._mem_bwd = torch.cuda.max_memory_allocated()
 
                 disabled_params = self._get_sample_disabled_param_names(
                     loss_weights=batch["loss_weights"]
                 )
+                self._probe_grad_layout("inside_no_sync")
+
                 self.grad_manager.clip_and_accumulate(
                     logging_info=logging_info, disabled_params=disabled_params
                 )
@@ -526,9 +621,6 @@ class OpenFold3AllAtom(ModelRunner):
     def _training_step(self, batch):
         example_feat = batch["token_mask"]
 
-        if len(self.ema.params) <= 1:
-            self.ema.init_params(self.model)
-
         if self.ema.device != example_feat.device:
             self.ema.to(example_feat.device)
 
@@ -566,13 +658,18 @@ class OpenFold3AllAtom(ModelRunner):
 
     def eval_step(self, batch, batch_idx):
         pdb_id = batch["pdb_id"]
-        is_repeated_sample = batch.get("repeated_sample")
+        is_repeated_sample = bool(batch.get("repeated_sample"))
         if is_repeated_sample:
             logger.debug(
                 f"Skipping repeated sample {', '.join(pdb_id)} on rank "
                 f"{self.global_rank}"
             )
-            return
+            if not self._forward_needs_rank_sync:
+                return
+
+            # Under a sharded strategy every wrapped module's forward is a
+            # collective, so returning here strands the other ranks in an
+            # all-gather. Run the forward to stay in step and drop the result.
 
         logger.debug(
             f"Started validation for {', '.join(pdb_id)} on rank {self.global_rank} "
@@ -582,6 +679,9 @@ class OpenFold3AllAtom(ModelRunner):
         try:
             # Run the model
             batch, outputs = self(batch)
+
+            if is_repeated_sample:
+                return
 
             # Compute loss and other metrics
             _, loss_breakdown = self.loss(batch, outputs, _return_breakdown=True)
@@ -767,15 +867,260 @@ class OpenFold3AllAtom(ModelRunner):
         # Reset metrics for next epoch
         metrics.reset()
 
+    def on_train_batch_start(self, batch, batch_idx):
+        """Start the per-step CUDA memory probe (see _write_mem_probe)."""
+        if not torch.cuda.is_available():
+            return
+
+        now = time.perf_counter()
+        self._t_step = now - getattr(self, "_t_prev", now)
+        self._t_prev = now
+
+        torch.cuda.reset_peak_memory_stats()
+        self._mem_floor = torch.cuda.memory_allocated()
+
+    def _capture_losses(self, loss_breakdown):
+        """Stash this step's scalar losses for _write_loss_probe.
+
+        Hooked here rather than on Lightning's on_train_batch_end `outputs`,
+        which is not a scalar under manual optimization. Stacked into one
+        tensor so the whole breakdown costs a single device-to-host copy.
+        """
+        keys = sorted(
+            k
+            for k, v in loss_breakdown.items()
+            if isinstance(v, torch.Tensor) and v.numel() == 1
+        )
+        if not keys:
+            self._loss_snapshot = {}
+            return
+
+        vals = torch.stack(
+            [loss_breakdown[k].detach().float().reshape(()) for k in keys]
+        )
+        self._loss_snapshot = dict(zip(keys, vals.tolist(), strict=True))
+
+    def _probe_grad_layout(self, where: str):
+        """One-shot: record parameter/gradient shapes as the clip path sees them.
+
+        Per-sample clipping needs each rank's *unsharded* gradient for its own
+        sample, so the whole design turns on whether p.grad is full-shaped or a
+        shard at this point. FSDP's no_sync behaviour is documented but where it
+        stores the accumulated gradient is internal, so measure it.
+        """
+        if getattr(self, f"_grad_layout_{where}", False):
+            return
+        setattr(self, f"_grad_layout_{where}", True)
+
+        def describe(tensor):
+            if tensor is None:
+                return None
+            to_local = getattr(tensor, "to_local", None)
+            local = to_local() if callable(to_local) else tensor
+            return {
+                "type": type(tensor).__name__,
+                "is_dtensor": callable(to_local),
+                "global_numel": tensor.numel(),
+                "local_numel": local.numel(),
+                "global_shape": list(tensor.shape),
+                "local_shape": list(local.shape),
+                "placements": (
+                    [str(x) for x in tensor.placements] if callable(to_local) else None
+                ),
+            }
+
+        sample = []
+        for name, param in list(self.model.named_parameters())[:400]:
+            sample.append(
+                {"name": name, "param": describe(param), "grad": describe(param.grad)}
+            )
+
+        def full_grads(d):
+            return (
+                d["grad"] is not None
+                and d["grad"]["local_numel"] == d["param"]["global_numel"]
+            )
+
+        interesting = [
+            d for d in sample if d["grad"] is not None and not full_grads(d)
+        ][:5]
+
+        outdir = os.environ.get("MEMPROBE_DIR", ".")
+        path = f"{outdir}/gradlayout.{where}.rank{self.global_rank}.json"
+        with open(path, "w") as fp:
+            json.dump(
+                {
+                    "where": where,
+                    "rank": self.global_rank,
+                    "strategy": type(self.trainer.strategy).__name__,
+                    "n_params_inspected": len(sample),
+                    "n_grad_none": sum(1 for d in sample if d["grad"] is None),
+                    "n_grad_unsharded": sum(1 for d in sample if full_grads(d)),
+                    "n_param_dtensor": sum(
+                        1 for d in sample if d["param"]["is_dtensor"]
+                    ),
+                    "n_grad_dtensor": sum(
+                        1 for d in sample if d["grad"] and d["grad"]["is_dtensor"]
+                    ),
+                    "total_param_local_numel": sum(
+                        d["param"]["local_numel"] for d in sample
+                    ),
+                    "total_grad_local_numel": sum(
+                        (d["grad"] or {}).get("local_numel", 0) for d in sample
+                    ),
+                    "example": sample[0],
+                    "mismatches": interesting,
+                },
+                fp,
+                indent=1,
+            )
+
+    def _log_optimizer_state_shapes(self):
+        """One-shot: record whether the optimizer state is actually sharded.
+
+        Under DDP each rank holds full-size Adam moments; under a sharded
+        strategy it should hold roughly 1/world_size. The memory floor is only
+        indirect evidence, and an unsharded optimizer would explain an
+        unwrapped FSDP run showing no memory benefit, so measure it directly.
+        """
+        if getattr(self, "_opt_state_logged", False):
+            return
+        self._opt_state_logged = True
+
+        opt = self.optimizers()
+        opt = getattr(opt, "optimizer", opt)
+
+        def local_numel(tensor):
+            # FSDP2 exposes parameters as DTensors, whose numel() is the global
+            # logical size; only to_local() gives this rank's physical shard.
+            to_local = getattr(tensor, "to_local", None)
+            return to_local().numel() if callable(to_local) else tensor.numel()
+
+        local_params = local_state = 0
+        for group in opt.param_groups:
+            for param in group["params"]:
+                local_params += local_numel(param)
+                state = opt.state.get(param, {})
+                for key in ("exp_avg", "exp_avg_sq"):
+                    moment = state.get(key)
+                    if torch.is_tensor(moment):
+                        local_state += local_numel(moment)
+
+        outdir = os.environ.get("MEMPROBE_DIR", ".")
+        with open(f"{outdir}/optstate.rank{self.global_rank}.json", "w") as fp:
+            json.dump(
+                {
+                    "rank": self.global_rank,
+                    "world_size": self.trainer.world_size,
+                    "strategy": type(self.trainer.strategy).__name__,
+                    "local_param_numel": local_params,
+                    "local_adam_state_numel": local_state,
+                },
+                fp,
+            )
+
+    def _write_loss_probe(self):
+        """Append this step's losses as one JSON line.
+
+        JSON rather than CSV because the breakdown's keys vary by step -- some
+        losses are only present when their weight is non-zero for the sample.
+        """
+        snap = getattr(self, "_loss_snapshot", None)
+        if not snap:
+            return
+
+        outdir = os.environ.get("MEMPROBE_DIR", ".")
+        with open(f"{outdir}/losses.rank{self.global_rank}.jsonl", "a") as fp:
+            fp.write(json.dumps({"step": self.global_step, **snap}) + "\n")
+
+    def _write_mem_probe(self, batch, loss=None):
+        """Append this step's CUDA memory high-water mark to a per-rank CSV.
+
+        Debug instrumentation for activation-memory work. Read at the top of
+        on_train_batch_end because the step's peak lands in the backward pass
+        (and, under blocks_per_ckpt, inside a checkpoint recompute), so anything
+        sampled after the forward pass misses it.
+
+        Columns: step, pdb_id, n_token, n_atom, floor_mb, peak_mb,
+        fwd_mb, loss_mb, bwd_mb (per-phase high-water marks), t_step
+        (wall seconds, measured start-to-start so no extra sync is forced),
+        loss, peak_all_mb (re-read after the EMA update).
+        `floor_mb` is the persistent allocation at batch start (parameters,
+        gradients, EMA copies, optimizer moments); `peak_mb` is the absolute
+        high-water mark, so activations are roughly the difference. Reserved
+        memory is deliberately not recorded: clear_cache_between_steps calls
+        empty_device_cache() mid-forward, which makes it report allocator
+        caching rather than model behaviour.
+
+        Peak scales with n_token^2 / n_atom^2, so compare peak-against-size
+        curves between runs rather than run averages -- crop-size variance is
+        far larger than the effects being measured.
+        """
+        if not torch.cuda.is_available():
+            return
+
+        mb = 1024**2
+        row = [
+            self.global_step,
+            " ".join(batch["pdb_id"]),
+            batch["token_mask"].shape[-1],
+            batch["atom_mask"].shape[-1],
+            getattr(self, "_mem_floor", 0) / mb,
+            getattr(self, "_mem_peak_pre_ema", 0) / mb,
+            getattr(self, "_mem_fwd", 0) / mb,
+            getattr(self, "_mem_loss", 0) / mb,
+            getattr(self, "_mem_bwd", 0) / mb,
+            getattr(self, "_t_step", 0.0),
+            loss,
+            torch.cuda.max_memory_allocated() / mb,
+        ]
+
+        # Attribute the per-sample clip path's GPU time: norm, rescale, and
+        # (under FSDP2) the pre-divide and the deferred reduce-scatter.
+        phases = collect_phase_times(self.grad_manager.phase_events)
+        row += [phases.get(k, "") for k in ("norm", "rescale", "divide", "reduce")]
+        outdir = os.environ.get("MEMPROBE_DIR", ".")
+        with open(f"{outdir}/memprobe.rank{self.global_rank}.csv", "a") as fp:
+            fp.write(",".join(map(str, row)) + "\n")
+
     def on_train_batch_end(self, outputs, batch, batch_idx):
         """Called after optimizer.step(). Gradients are present and clipped."""
 
-        # Skip grad accumulation steps
+        # Sampled here, before the EMA update, so peak_mb keeps the same meaning
+        # it had in every earlier run; peak_all_mb below re-reads afterwards so
+        # the EMA update's own transients cannot hide behind the probe.
+        self._mem_peak_pre_ema = (
+            torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
+        )
+
+        # outputs is training_step's return value, i.e. the step loss. The
+        # .item() sync is already paid by the progress-bar callback.
+        loss = (
+            float(outputs.detach())
+            if isinstance(outputs, torch.Tensor) and outputs.numel() == 1
+            else None
+        )
+
+        # Skip grad accumulation steps. Micro-batches each get their own reset
+        # in on_train_batch_start, so record them before returning.
         if not self._is_opt_step_ready(batch_idx):
+            self._write_mem_probe(batch, loss=loss)
+            self._write_loss_probe()
             return
 
-        # EMA weight update
-        self.ema.update(self.model)
+        # EMA weight update. Seeded here rather than at the start of the step:
+        # FSDP lazy-shards its parameters on the first forward, so a shadow
+        # built beforehand captures full shapes that no longer match the local
+        # shards by the time update() runs. Seeding immediately before the
+        # first update keeps both reading the same view.
+        if len(self.ema.params) <= 1:
+            self.ema.init_params(self.model)
+        else:
+            self.ema.update(self.model)
+
+        self._write_mem_probe(batch, loss=loss)
+        self._write_loss_probe()
+        self._log_optimizer_state_shapes()
 
         # Log the clipped step norm when not using per-sample gradient clipping
         # In order to match the logging step of per-sample grad clipping,

@@ -2,7 +2,7 @@ name: openfold3-env
 channels:
   - conda-forge
   - bioconda
-  - pytorch
+  - conda-forge::pytorch
   - nvidia
 dependencies:
   - python

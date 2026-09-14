@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -33,7 +34,12 @@ from pytorch_lightning.callbacks.lr_monitor import LearningRateMonitor
 from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.plugins.environments import MPIEnvironment
-from pytorch_lightning.strategies import DDPStrategy, DeepSpeedStrategy
+from pytorch_lightning.strategies import (
+    DDPStrategy,
+    DeepSpeedStrategy,
+    FSDPStrategy,
+    ModelParallelStrategy,
+)
 
 from openfold3.core.data.framework.data_module import (
     DataModule,
@@ -230,7 +236,9 @@ class ExperimentRunner(ABC):
         return MPIEnvironment() if self.is_mpi else None
 
     @cached_property
-    def strategy(self) -> DDPStrategy | DeepSpeedStrategy | str:
+    def strategy(
+        self,
+    ) -> DDPStrategy | DeepSpeedStrategy | FSDPStrategy | ModelParallelStrategy | str:
         """Determine and return the training strategy."""
         if self.deepspeed_config_path is not None:
             _strategy = DeepSpeedStrategy(
@@ -246,6 +254,22 @@ class ExperimentRunner(ABC):
             return _strategy
 
         if self.is_distributed:
+            if self.pl_trainer_args.distributed_strategy == "fsdp2":
+                # Pure data parallelism. The "auto" defaults would give
+                # data_parallel_size=n_nodes and tensor_parallel_size=n_gpus,
+                # i.e. tensor parallelism within the node, which is not wanted.
+                return ModelParallelStrategy(
+                    data_parallel_size=self.world_size,
+                    tensor_parallel_size=1,
+                    save_distributed_checkpoint=(
+                        self.pl_trainer_args.fsdp2_distributed_checkpoint
+                    ),
+                    timeout=self.pl_trainer_args.distributed_timeout,
+                )
+
+            if self.pl_trainer_args.distributed_strategy == "fsdp":
+                return self._fsdp_strategy()
+
             return DDPStrategy(
                 find_unused_parameters=False,
                 cluster_environment=self.cluster_environment,
@@ -253,6 +277,86 @@ class ExperimentRunner(ABC):
             )
 
         return "auto"
+
+    def _fsdp_strategy(self) -> FSDPStrategy:
+        """Build the FSDP strategy, sharding at the configured granularity.
+
+        Wrapping into more than one unit is what lets parameters be freed after
+        each unit's forward; a single FlatParameter keeps all 1405 MiB resident
+        for the whole step, which is why an unwrapped FSDP run shows no peak
+        benefit. Gradient and optimizer-state sharding happens either way.
+
+        use_orig_params keeps named_parameters() returning real parameter
+        names, which the per-sample gradient path needs -- it identifies
+        inactive parameters by name prefix (see
+        OpenFold3AllAtom._get_sample_disabled_param_names).
+        """
+        from torch.distributed.fsdp import BackwardPrefetch
+        from torch.distributed.fsdp.wrap import (
+            ModuleWrapPolicy,
+            size_based_auto_wrap_policy,
+        )
+
+        from openfold3.core.model.latent.msa_module import (
+            MSAModuleBlock,
+            MSAModuleStack,
+        )
+        from openfold3.core.model.latent.pairformer import (
+            PairFormerBlock,
+            PairFormerStack,
+        )
+        from openfold3.core.model.latent.template_module import (
+            TemplatePairBlock,
+            TemplatePairStack,
+        )
+        from openfold3.core.model.layers.diffusion_transformer import (
+            DiffusionTransformer,
+            DiffusionTransformerBlock,
+        )
+
+        if self.pl_trainer_args.fsdp_wrap_granularity == "minimal":
+            # Overhead scales with unit count -- measured ~2%/unit at 8 units
+            # and ~3.3%/unit at 91 on this launch-bound model, where FSDP's
+            # per-unit CPU bookkeeping lands directly on wall time. Wrapping
+            # only the largest modules keeps the sharding win (which is
+            # granularity-independent) with the fewest units.
+            return FSDPStrategy(
+                auto_wrap_policy=functools.partial(
+                    size_based_auto_wrap_policy,
+                    min_num_params=self.pl_trainer_args.fsdp_min_wrap_params,
+                ),
+                use_orig_params=True,
+                backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+                forward_prefetch=True,
+                limit_all_gathers=False,
+                cluster_environment=self.cluster_environment,
+                timeout=self.pl_trainer_args.distributed_timeout,
+            )
+
+        wrap_classes = (
+            {PairFormerStack, MSAModuleStack, TemplatePairStack, DiffusionTransformer}
+            if self.pl_trainer_args.fsdp_wrap_granularity == "stack"
+            else {
+                PairFormerBlock,
+                MSAModuleBlock,
+                TemplatePairBlock,
+                DiffusionTransformerBlock,
+            }
+        )
+
+        return FSDPStrategy(
+            auto_wrap_policy=ModuleWrapPolicy(wrap_classes),
+            use_orig_params=True,
+            # Overlap the parameter all-gathers with compute. Without these the
+            # collectives serialize against the step: measured ~76 ms each
+            # against a 3-15 ms bandwidth floor for the largest units, so the
+            # cost was stall, not transfer volume.
+            backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+            forward_prefetch=True,
+            limit_all_gathers=False,
+            cluster_environment=self.cluster_environment,
+            timeout=self.pl_trainer_args.distributed_timeout,
+        )
 
     ###############
     # Logging and Callbacks
@@ -278,7 +382,15 @@ class ExperimentRunner(ABC):
     def trainer(self) -> pl.Trainer:
         """Create and return the trainer instance."""
         trainer_args = self.pl_trainer_args.model_dump(
-            exclude={"deepspeed_config_path", "distributed_timeout", "mpi_plugin"}
+            exclude={
+                "deepspeed_config_path",
+                "distributed_strategy",
+                "fsdp_wrap_granularity",
+                "fsdp_min_wrap_params",
+                "fsdp2_distributed_checkpoint",
+                "distributed_timeout",
+                "mpi_plugin",
+            }
         )
         trainer_args.update(
             {
